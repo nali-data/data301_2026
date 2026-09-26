@@ -1,0 +1,374 @@
+---
+title: "assignment4"
+author: "Nali Patel 300664722"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages}
+library(dplyr)
+library(fpp2)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+theme_set(theme_minimal(base_size = 11))
+
+```
+
+## Exercise 1
+
+We have $n$ i.i.d. observations $X_1,\dots,X_n \sim \text{Exponential}(\lambda)$, mean $1/\lambda$.
+Two estimators of $\lambda$ are given:
+
+$$
+\hat\lambda_{ML}(\mathbf X) = \left(\frac1n\sum_{i=1}^n X_i\right)^{-1},
+\qquad
+\hat\lambda_{IQR}(\mathbf X) = \frac{\ln 3}{q_{3/4}(\mathbf X) - q_{1/4}(\mathbf X)}.
+$$
+
+$\hat\lambda_{IQR}$ comes from the "analogy" idea: for an exponential distribution the population quartiles satisfy $q_p = -\ln(1-p)/\lambda$, so $q_{3/4}-q_{1/4} = \ln(3)/\lambda$. Swapping the population quartiles for sample quartiles gives $\hat\lambda_{IQR}$.
+
+### 1. Definition of sample quantiles and why? 
+Hyndman and Fan (1996), as summarised by Wicklin (2017), looked at 9 different ways that statistical software calculates sample quantiles. The 9 methods are split by 2 groups; 3 work by averaging a nearby data point once its sorted and 6 work by interpolating between two neighbouring sorted data points. For a given probability and sample size, each method finds a position $j = [Np + m]$ in the sorted data (the constant $m$ changed depending on the method). For the interpolation methods, the value at that position gets blended with the next one using a weight. 
+The 9 methods just disagree about how to line up the sorted values with their corresponding probabilities. Some aim to be unbiased if the data is normally distributed, some use the standard empirical CDF approach and some try to stay unbiased regardless of distribution etc. 
+
+In practice type 7 and type 8 show up consistently. 
+Type 7 is R's default. It interpolates using $p_k = \frac{(k-1)} {(n-1)}$. The sample's min and max always equal the 0% and 100% quantiles but it isn't generally unbiased as an estimate of the true population quantile.
+Type 8 interpolates using $p_k = \frac{(k-\frac{1}{3})} {(n+\frac{1}{3})}$, the resulting quantile estimate stays roughly median-unbiased regardless of the distribution. Hyndman and Fan, recommend this as the best general purpose choice. 
+
+I chose type 7 due to the practical reasoning as it gets the same output as quantile() without having to alter any settings therefore my results can line up with others rerunning the code. Also as sample sizes are $n = 30,100$ the gap between Type 7 and Type 8 is a very small fraction of $\hat\lambda$. If the priority was to reduce bias in the quantile estimate across a range of distributions then Type 8 would be ideal as this is what it was designed for. 
+
+The software defaults for R is quantile() which uses Type 7 and Python's is numpy.quantile() which also uses Type 7. 
+
+```{r 1.1}
+#check default
+
+args(stats:::quantile.default)
+
+```
+
+### 2. first-order bootstrap bias-corrected estimator 
+```{r 1.2}
+#mle 
+lambda_ML <- function(x) {
+  1 / mean(x)
+}
+
+#IQR based est.
+lambda_IQR <- function(x, type = 7) {
+  q <- quantile(x, probs = c(0.25, 0.75), type = type)
+  log(3) / (q[2] - q[1])
+}
+
+#first-order bootstrap bias-corrected version of lambda_IQR
+lambda_tilde <- function(x, B = 200, type = 7) {
+
+  n <- length(x)
+  theta_hat <- lambda_IQR(x, type)   #estimate on og sample
+
+  #B bootstrap resamples and compute lambda_IQR on each one
+  boot_estimates <- numeric(B)
+  for (b in 1:B) {
+    resample <- sample(x, size = n, replace = TRUE)
+    boot_estimates[b] <- lambda_IQR(resample, type)
+  }
+
+  #resample can occasionally have q3 == q1 (IQR = 0), which makes lambda_IQR infinite. so drop those resamples before averaging.
+  boot_estimates <- boot_estimates[is.finite(boot_estimates)]
+  if (length(boot_estimates) == 0) return(NA_real_)
+
+  boot_mean <- mean(boot_estimates)
+  2 * theta_hat - boot_mean
+}
+
+```
+
+At $n=5$ the IQR of the original sample already lands on 2 out of 5 order statistics meaning no interpolation needed with type 7 when $n=5$. Then when we bootstrap-resample with replacement, there is a chance that the same original value gets drawn for both the $q_{1/4}$ and $q_{3/4}$ positions, giving $q_{3/4} - q_{1/4} = 0$ and $\hat\lambda_{IQR} = \infty$ for that resample. A quick simulation shows this happens for roughly 10% of individual bootstrap resamples when $n = 5$ (versus essentially never at $n = 30$ or $100$). With $B = 200$ resamples, it is almost certain that at least one comes back infinite, so a single bad resample would make a plain average infinite too. The fix used above is the standard one: only average the finite bootstrap estimates. This keeps $\tilde\lambda$ defined.
+
+### 3. Monte Carlo comparison 
+Parameter space: $\lambda \in \{0.1, 1, 10\}$, $n \in \{5, 30, 100\}$ (9 combinations). 
+
+$$
+\widehat{\text{MSE}}(\hat\lambda) = \frac1M\sum_{m=1}^M \left(\hat\lambda^{(m)}-\lambda\right)^2 .
+$$
+The Monte Carlo mean has standard error roughly $\text{SD}/\sqrt{M}$, so more replications means more precision, but at $n=5$ the squared errors are  heavily-tailed (because $\hat\lambda_{IQR}$ and $\tilde\lambda$ can blow up when the sample's IQR is tiny), so no realistic $M$ makes the result fully stable. Given that, I used:
+ $M = 2{,}000$ for $n = 30$ and $n = 100$, where all 3 estimators behave well, this is already more than enough replications for a stable MSE estimate.
+ $M = 10{,}000$ for $n = 5$, a larger number to average out some of the extreme values, while still reporting the result with the caveat above rather than pretending it is precise.
+
+```{r mcsimulation}
+set.seed(123)
+
+lambdas <- c(0.1, 1, 10)
+ns      <- c(5, 30, 100)
+
+#number of Monte Carlo replications
+reps_for_n <- function(n) if (n == 5) 10000 else 2000
+
+results <- data.frame()
+
+for (lam in lambdas) {
+  for (n in ns) {
+
+    M <- reps_for_n(n)
+
+    #three estimators storage. one val per replication
+    ML_est  <- numeric(M)
+    IQR_est <- numeric(M)
+    TIL_est <- numeric(M)
+
+    for (m in 1:M) {
+      x <- rexp(n, rate = lam)          #simulate one sample
+      ML_est[m]  <- lambda_ML(x)
+      IQR_est[m] <- lambda_IQR(x)
+      TIL_est[m] <- lambda_tilde(x, B = 200)
+    }
+
+    #MSE
+    mse <- function(est) mean((est[is.finite(est)] - lam)^2)
+
+    results <- rbind(results, data.frame(
+      lambda    = lam,
+      n         = n,
+      M         = M,
+      MSE_ML    = mse(ML_est),
+      MSE_IQR   = mse(IQR_est),
+      MSE_tilde = mse(TIL_est)
+    ))
+  }
+}
+
+kable(results, digits = 4,
+             caption = "Monte Carlo MSE of the three estimators of lambda")
+
+
+```
+```{r mcsimulation plot}
+#reshape to long 
+results_long <- reshape(
+  results,
+  varying   = c("MSE_ML", "MSE_IQR", "MSE_tilde"),
+  v.names   = "MSE",
+  timevar   = "estimator",
+  times     = c("ML", "IQR", "tilde"),
+  direction = "long"
+)
+
+ggplot(results_long, aes(x = factor(n), y = MSE, fill = estimator)) +
+  geom_col(position = "dodge") +
+  scale_y_log10() +
+  facet_wrap(~ lambda, scales = "free_y", labeller = label_both) +
+  labs(x = "sample size n", y = "MSE (log scale)",
+       title = "Monte Carlo MSE by estimator, n and lambda")
+
+```
+
+Three patterns emerged consistently which was : 
+1. The maximum-likelihood estimator wins everywhere which matches the theory that the exponential model here is correctly specified. Hence, the MLE is efficient in large samples. It also uses the whole sample (through $\sum X_i$), while $\hat\lambda_{IQR}$ only uses two order statistics, so it has less information to work with.
+
+2. At $n = 30, 100$, the bias correction makes MSE slightly worse. At these sample sizes $\hat\lambda_{IQR}$ is already close to unbiased, so there is not much bias to remove, while the bootstrap correction itself adds extra noise (it is built from only $B=200$ resamples). Removing a small bias at the cost of extra variance is a net loss here.
+
+3. At $n = 5$, both $\hat\lambda_{IQR}$ and especially $\tilde\lambda$ are dramatically worse than $\hat\lambda_{ML}$. Plus the bias correction makes things worse. This is the same mechanism where a tiny sample IQR makes $\hat\lambda_{IQR}$ huge, and because it doubles that extreme value before correcting it, the correction can push $\tilde\lambda$ even further from $\lambda$. Therefore the bootstrap bias correction is not free and applying it to an already unstable statistic with a small sample size can turn a poor estimator into a worse one.
+
+
+## Excerise 2: ausbeer 
+
+```{r 2}
+data(ausbeer)
+
+ausbeer_df <- data.frame(
+  year = as.numeric(time(ausbeer)),
+  production = as.numeric(ausbeer)
+)
+
+#plot of Quarterly Australian beer production
+ggplot(ausbeer_df, aes(x = year, y = production)) +
+  geom_line() +
+  labs(x = "Year", y = "Megalitres",
+       title = "Quarterly Australian beer production")
+
+```
+
+### 1. Frequency of the series
+```{r freq}
+frequency(ausbeer)
+```
+
+```{r autocorrelation function}
+#compute ACF vals
+acf_val <- acf(ausbeer, plot = FALSE)
+
+#dataframe
+acf_df <- data.frame(
+  lag = acf_val$lag[,1,1],
+  acf = acf_val$acf[,1,1]
+) |>
+  filter(lag != 0) #always 1 
+
+#95% conf. 
+n <- length(ausbeer)
+conflevel <- qnorm((1+0.95)/2)/ sqrt(n)
+
+#seasonal lags
+acf_df <- acf_df |>
+  mutate(seasonal = lag %% 4 ==0)
+
+#plot
+ggplot(acf_df, aes(x=lag, y= acf)) + 
+  geom_hline(yintercept = 0, colour = "black") +
+  geom_hline(yintercept = c(-conflevel, conflevel),
+             colour = "purple", linetype = "dashed") + 
+  geom_segment(aes(xend = lag, yend = 0, colour = seasonal)) + 
+  geom_point(aes(colour = seasonal), size = 2) + 
+  scale_color_manual(values = c("TRUE" = "green", "FALSE" = "red"), guide = "none") + 
+  labs(
+    x = "Lag",
+    y = "Autocorrelation",
+    title = "Autocorrelation Function of Beer Production"
+  ) + 
+  theme_minimal(base_size = 12)
+
+```
+
+The series is quarterly with frequency of 4 observations throughout the year. This visible in the data through the time series plot which demonstrates which repeats a similar up and down shape every 4 points, and the autocorrelation function which has sharp spikes at lags 4, 8, 12,(the 4 point seasonal pattern)
+
+### 2. Overall behaviour of series
+There is a clear long term trend, but it is not a straight line. Production rises steadily from around 260 megalitres/quarter in the late 1950s to roughly 500 by the mid-1970s, then the trend flattens and drifts slightly down from the 1990s onward, ending around 410–420 by 2010. The STL decomposition makes this pattern clean to see.
+
+```{r stl plot}
+ausbeer_stl <- stl(ausbeer, s.window = "periodic", robust = TRUE)
+
+#components + og data
+stl_components <- as.data.frame(ausbeer_stl$time.series)
+stl_df <- data.frame(
+  time = as.numeric(time(ausbeer)),
+  data = as.numeric(ausbeer),
+  seasonal = stl_components$seasonal,
+  trend = stl_components$trend,
+  remainder = stl_components$remainder
+)
+
+#reshape to long 
+stl_long <- pivot_longer(
+  stl_df,
+  cols = c(data, seasonal, trend, remainder),
+  names_to = "component",
+  values_to = "value"
+)
+
+#set factor order so panels appear in the conventional STL order
+stl_long$component <- factor(
+  stl_long$component,
+  levels = c("data", "seasonal", "trend", "remainder")
+)
+
+ggplot(stl_long, aes(x = time, y = value)) +
+  geom_line() +
+  facet_grid(component ~ ., scales = "free_y") +
+  labs(x = "Year", y = NULL, title = "STL decomposition of ausbeer")
+
+```
+
+
+### 3. Evidence of seasonality
+
+```{r seasonality}
+ausbeer_df <- data.frame(
+  time = as.numeric(time(ausbeer)),
+  year = floor(as.numeric(time(ausbeer))),
+  quarter = cycle(ausbeer),
+  value = as.numeric(ausbeer)
+)
+
+#seasonal plot 
+ggplot(ausbeer_df, aes(x = quarter, y = value, group = year, color = factor(year))) +
+  geom_line() +
+  scale_x_continuous(breaks = 1:4, labels = paste0("Q", 1:4)) +
+  labs(x = "Quarter", y = "Megalitres", title = "Seasonal plot of ausbeer", color = "Year")
+
+#subseries
+quarter_means_df <- aggregate(value ~ quarter, data = ausbeer_df, FUN = mean)
+
+ggplot(ausbeer_df, aes(x = time, y = value)) +
+  geom_line() +
+  geom_hline(
+    data = quarter_means_df,
+    aes(yintercept = value),
+    color = "blue"
+  ) +
+  facet_grid(. ~ quarter, labeller = as_labeller(function(x) paste0("Q", x))) +
+  labs(x = "Year", y = "Megalitres", title = "Subseries plot of ausbeer")
+
+```
+
+Seasonality appears to be strong and regular as it is the most obvious feature of the raw plot.
+
+### 4. Variability
+
+```{r variability}
+#which decade for each ob
+decade <- floor(as.numeric(time(ausbeer)) / 10) * 10
+
+decade_sd <- tapply(as.numeric(ausbeer), decade, sd)
+kable(t(round(decade_sd, 1)),
+             caption = "Standard deviation of quarterly production, by decade")
+```
+
+Variability appears to rises from the 1950s (SD $\approx$ 36) to a peak around the 1970s (SD $\approx$ 62), then falls through to the 2000s–2010s (SD $\approx$ 28–37) despite the level of production in the 2000s (around 415) is still similar to the 1970s level (around 460). Hence, this is not the usual variance grows with the level pattern that would justify log transformation. Production seems to have become more consistent over the last few decades, on top of a trend that rose and then gently declined.
+
+### 5. Anything Unusual?
+
+```{r stl outliers}
+remainder <- ausbeer_stl$time.series[, "remainder"]
+
+outlier_table <- data.frame(
+  time      = as.numeric(time(ausbeer)),
+  value     = as.numeric(ausbeer),
+  remainder = round(as.numeric(remainder), 1)
+)
+
+#outliers
+outlier_table <- outlier_table[order(-abs(outlier_table$remainder)), ]
+
+kable(head(outlier_table, 6), row.names = FALSE,
+             caption = "Largest deviations from trend + seasonal pattern")
+```
+
+The raw series is misleading because the biggest swings are just the regular Q4 seasonal peaks. A fairer way to spot genuinely unusual points is to look at the remainder component of the STL decomposition (what's left after removing trend and season).
+
+The most unusual quarters are 1981 Q1 (548: well above what trend + season would predict), 1990 Q4 and1988 Q4 (599 and 598: unusually strong summer peaks even for Q4), and 1978 Q3 (431: unusually low). These deviate from the smooth trend/season pattern by 50–75 megalitres, roughly 3–5 times the typical remainder standard deviation (15).
+
+### 6. Series by season
+
+The seasonal plot draws each year as its own line laid out by quarter, which makes the yearly pattern easy to see at a glance: production rises from Q2 to a peak at Q4, then drops back down at Q1, and since every year's line follows this same shape, it confirms the seasonality is stable rather than changing over time — and because all the years share the same quarter axis, it's also easy to compare the same quarter across different years, revealing that recent Q4s are actually lower than the Q4 peaks from the late 1980s/early 1990s, a comparison that's much harder to make on the raw 55-year time-series plot where quarters are all smeared together along the x-axis.
+
+### 7. Seasonal subseries
+The subseries plot groups all the data by quarter into four separate panels, and it confirms what the seasonal plot showed that Q4 has the highest average production, Q1 is second, and Q2 is the lowest with Q3 close behind it. What's especially clear here is how stable this ranking is over time. Each quarter's panel follows the same overall rise-then-plateau/decline shape as the full series, but just sitting at its own consistent level, and none of the four panels ever cross over or swap places with each other. This consistency is exactly why classical decomposition methods can get away with using a single "seasonal index" per quarter since each quarter reliably sits at roughly the same offset year after year, one fixed number per quarter is a reasonable way to capture the seasonal effect.
+
+
+### 8. Detrend or transform series before modelling?
+
+I'd detrend from this series (the STL trend line makes it obvious that beer production shifted substantially higher and lower over the 1956–2010 period, so it's not sitting around a stable average) but I wouldn't automatically apply a log or Box-Cox transformation just to "even out" the variance, the way that's sometimes done as a routine step.
+```{r detrend}
+ausbeer_log_df <- data.frame(
+  year = as.numeric(time(ausbeer)),
+  log_production = as.numeric(log(ausbeer))
+)
+
+ggplot(ausbeer_log_df, aes(x = year, y = log_production)) +
+  geom_line() +
+  labs(x = "Year", y = "log(Megalitres)",
+       title = "Log of quarterly beer production")
+
+```
+
+If you look at the data on a log scale, the seasonal ups and downs do look a bit more consistent during the early fast growing years (1956 to 1975), which fits with the idea that the seasonal swings were roughly proportional to the level back then. But from the mid 1970s onward, once growth flattens out and production starts gently declining, that relationship breaks down: the variability doesn't shrink in line with the level anymore, it actually shrinks faster than the level does. So for that whole later stretch, a log transform doesn't really help and just makes the numbers harder to read in their natural units (megalitres). Put simply, the case for transforming the data is only really strong for that early growth period, so applying one transform across the entire 55 years isn't well justified. Detrending, whether through STL or seasonal differencing, already fixes the main problem (the series not being stationary) without needing a variance stabilising transform tacked on everywhere.
+
+
+
+
+
